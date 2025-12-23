@@ -4,6 +4,7 @@ from duckdb import query
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import wandb
 CORPUS_PATH = "data/urbandict_corpus.txt"
 
 # %% Load data ###############################################
@@ -38,9 +39,12 @@ eval_interval = 1000
 eval_iters = 200
 n_embed = 32
 num_heads = 4
-n_layers = 4
+n_layers = 3
 ff_expand_ratio = 4
 dropout = 0.2
+max_steps = 10_001
+
+run_name = f"layer_sweep_{n_layers}"
 
 
 def get_batch(split):
@@ -201,13 +205,31 @@ class BigramLanguageModel(nn.Module):
         idx = torch.zeros((1, 1), dtype=torch.long)  # starting token
         return decode(self.generate(idx, max_new_tokens=100)[0].tolist())
 
+
+# %% Training loop ###############################################
 m = BigramLanguageModel()
 m = m.to(device)
 
-# %% Training loop ###############################################
+# Initialize wandb
+wandb.init(
+    project="urban-dict-transformer",
+    name=run_name,
+    config={
+        "batch_size": batch_size,
+        "block_size": block_size,
+        "n_embed": n_embed,
+        "num_heads": num_heads,
+        "n_layers": n_layers,
+        "ff_expand_ratio": ff_expand_ratio,
+        "dropout": dropout,
+        "max_steps": max_steps,
+        "num_params": sum(p.numel() for p in m.parameters())
+    }
+)
+
 optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3)
 
-for step in range(10_001):
+for step in range(max_steps):
     # sample a batch of data
     xb, yb = get_batch('train')
 
@@ -220,6 +242,13 @@ for step in range(10_001):
     if step % eval_interval == 0:
         losses = estimate_loss(m)
         print(f"step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        wandb.log({
+            "train_loss": losses['train'],
+            "val_loss": losses['val'],
+            "step": step,
+        })
+
+wandb.finish()
 
 # %% Test generation ###############################################
 print(m.full_generate())
