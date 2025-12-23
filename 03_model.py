@@ -44,7 +44,7 @@ ff_expand_ratio = 4
 dropout = 0.2
 max_steps = 10_001
 
-run_name = f"layer_sweep_{n_layers}"
+run_name = f"non-compiled_r2_{n_layers}"
 
 
 def get_batch(split):
@@ -71,47 +71,66 @@ def estimate_loss(model):
 
 
 class MultiHeadAttention(nn.Module):
-    """Multiple heads of self-attention in parallel"""
+    """Multiple heads of self-attention using fused scaled_dot_product_attention"""
 
     def __init__(self, num_heads, head_size):
         super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.num_heads = num_heads
+        self.head_size = head_size
+
+        # Single fused projection for Q, K, V across all heads
+        # Instead of num_heads separate (n_embed -> head_size) projections,
+        # we do one big (n_embed -> 3 * num_heads * head_size) projection
+        self.qkv = nn.Linear(n_embed, 3 * num_heads * head_size, bias=False)
         self.proj = nn.Linear(num_heads * head_size, n_embed)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        B, T, C = x.shape  # (Batch=16, Time=8, Channels=32)
+
+        # Project to Q, K, V for all heads in one matmul
+        qkv = self.qkv(x)
+        # x:   (B, T, n_embed)           e.g. (16, 8, 32)
+        # qkv: (B, T, 3 * num_heads * head_size)  e.g. (16, 8, 96) if 4 heads * 8 head_size * 3
+
+        # Reshape to separate out the 3 (for Q,K,V), num_heads, and head_size
+        qkv = qkv.reshape(B, T, 3, self.num_heads, self.head_size)
+        # qkv: (B, T, 3, num_heads, head_size)  e.g. (16, 8, 3, 4, 8)
+
+        # Permute to get (3, B, num_heads, T, head_size) so we can unpack Q, K, V
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        # qkv: (3, B, num_heads, T, head_size)  e.g. (3, 16, 4, 8, 8)
+
+        # Unpack into separate Q, K, V tensors
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        # q, k, v each: (B, num_heads, T, head_size)  e.g. (16, 4, 8, 8)
+
+        # Flash attention! This fused kernel does:
+        #   1. Q @ K.T / sqrt(head_size)
+        #   2. Causal masking
+        #   3. Softmax
+        #   4. Dropout (if training)
+        #   5. Attention @ V
+        # All in one fused CUDA kernel (when available)
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            is_causal=True,
+            dropout_p=dropout if self.training else 0.0
+        )
+        # out: (B, num_heads, T, head_size)  e.g. (16, 4, 8, 8)
+
+        # Transpose to bring T back to position 1, then flatten heads
+        out = out.transpose(1, 2)
+        # out: (B, T, num_heads, head_size)  e.g. (16, 8, 4, 8)
+
+        out = out.reshape(B, T, self.num_heads * self.head_size)
+        # out: (B, T, num_heads * head_size)  e.g. (16, 8, 32)
+
+        # Final projection back to n_embed (mixes information across heads)
         out = self.proj(out)
+        # out: (B, T, n_embed)  e.g. (16, 8, 32)
+
         out = self.dropout(out)
-        return out
-
-
-class Head(nn.Module):
-    """One head of self-attention"""
-
-    def __init__(self, head_size):
-        super().__init__()
-        self.key = nn.Linear(n_embed, head_size, bias=False)
-        self.query = nn.Linear(n_embed, head_size, bias=False)
-        self.value = nn.Linear(n_embed, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-
-        self.dropout = nn.Dropout(dropout)
-    
-    def forward(self, x):
-        B,T,C = x.shape
-        k = self.key(x)  # B, T, head_size
-        q = self.query(x)  # B, T, head_size
-
-        # compute attention
-        wei = q @ k.transpose(-2, -1) * C ** -0.5  # (B,T,C) @ (B,C,T) --> (B,T,T)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # (B, T, T)
-        wei = F.softmax(wei, dim=-1)  # (B, T, T)
-        wei = self.dropout(wei)
-
-        # weighted aggregation
-        v = self.value(x)
-        out = wei @ v  # (B, T, T) @ (B, T, head_size) --> (B, T, head_size)
         return out
 
 
@@ -157,7 +176,7 @@ class BigramLanguageModel(nn.Module):
         self.blocks = nn.Sequential(
             *[Block(n_embed, num_heads=num_heads) for _ in range(n_layers)],
         )
-        self.ln_f = nn.LayerNorm(n_embed)
+        self.layer_norm_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -167,7 +186,7 @@ class BigramLanguageModel(nn.Module):
         x = tok_emb + pos_emb  # (Batch, Token, n_embed) broadcasting addition
         
         x = self.blocks(x)  # (Batch, Token, n_embed)
-        x = self.ln_f(x)  # (Batch, Token, n_embed)
+        x = self.layer_norm_f(x)  # (Batch, Token, n_embed)
         logits = self.lm_head(x)  # (Batch, Token, Vocab_size)
 
         if targets is None:
@@ -209,6 +228,7 @@ class BigramLanguageModel(nn.Module):
 # %% Training loop ###############################################
 m = BigramLanguageModel()
 m = m.to(device)
+m = torch.compile(m)
 
 # Initialize wandb
 wandb.init(
