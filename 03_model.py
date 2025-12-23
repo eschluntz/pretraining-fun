@@ -38,6 +38,9 @@ eval_interval = 1000
 eval_iters = 200
 n_embed = 32
 num_heads = 4
+n_layers = 4
+ff_expand_ratio = 4
+dropout = 0.2
 
 
 def get_batch(split):
@@ -69,9 +72,14 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(num_heads * head_size, n_embed)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        return torch.cat([h(x) for h in self.heads], dim=-1)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.proj(out)
+        out = self.dropout(out)
+        return out
 
 
 class Head(nn.Module):
@@ -83,6 +91,8 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embed, head_size, bias=False)
         self.value = nn.Linear(n_embed, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+
+        self.dropout = nn.Dropout(dropout)
     
     def forward(self, x):
         B,T,C = x.shape
@@ -93,6 +103,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2, -1) * C ** -0.5  # (B,T,C) @ (B,C,T) --> (B,T,T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # (B, T, T)
         wei = F.softmax(wei, dim=-1)  # (B, T, T)
+        wei = self.dropout(wei)
 
         # weighted aggregation
         v = self.value(x)
@@ -100,12 +111,49 @@ class Head(nn.Module):
         return out
 
 
+class FeedForward(nn.Module):
+    """A simple feedforward layer"""
+
+    def __init__(self, n_embed):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embed, ff_expand_ratio * n_embed),
+            nn.ReLU(),
+            nn.Linear(ff_expand_ratio * n_embed, n_embed),  # projection back to n_embed
+            nn.Dropout(dropout),
+        )
+    
+    def forward(self, x):
+        return self.net(x)
+
+
+class Block(nn.Module):
+    """Transformer block: attention then feedforward"""
+
+    def __init__(self, n_embed, num_heads):
+        super().__init__()
+        head_size = n_embed // num_heads
+        self.sa_heads = MultiHeadAttention(num_heads=num_heads, head_size=head_size)
+        self.ffwd = FeedForward(n_embed)
+        self.ln1 = nn.LayerNorm(n_embed)
+        self.ln2 = nn.LayerNorm(n_embed)
+
+    def forward(self, x):
+        x = x + self.sa_heads(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
+
 class BigramLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.token_embedding_table = nn.Embedding(num_embeddings=vocab_size, embedding_dim=n_embed)
         self.position_embedding_table = nn.Embedding(num_embeddings=block_size, embedding_dim=n_embed)
-        self.sa_heads = MultiHeadAttention(num_heads=num_heads, head_size=n_embed // num_heads)
+        
+        self.blocks = nn.Sequential(
+            *[Block(n_embed, num_heads=num_heads) for _ in range(n_layers)],
+        )
+        self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -114,7 +162,8 @@ class BigramLanguageModel(nn.Module):
         pos_emb = self.position_embedding_table(torch.arange(T, device=device))  # (Token, n_embed)
         x = tok_emb + pos_emb  # (Batch, Token, n_embed) broadcasting addition
         
-        x = self.sa_heads(x)  # (Batch, Token, n_embed)
+        x = self.blocks(x)  # (Batch, Token, n_embed)
+        x = self.ln_f(x)  # (Batch, Token, n_embed)
         logits = self.lm_head(x)  # (Batch, Token, Vocab_size)
 
         if targets is None:
@@ -127,7 +176,9 @@ class BigramLanguageModel(nn.Module):
 
         return logits, loss
 
+    @torch.no_grad()
     def generate(self, idx, max_new_tokens):
+        self.eval()
         # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
 
@@ -142,6 +193,8 @@ class BigramLanguageModel(nn.Module):
             probs = F.softmax(logits, dim=-1)  # (B, C)
             idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
             idx = torch.cat((idx, idx_next), dim=1)  # append to sequence
+        
+        self.train()
         return idx
     
     def full_generate(self):
@@ -154,7 +207,7 @@ m = m.to(device)
 # %% Training loop ###############################################
 optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3)
 
-for step in range(10_000):
+for step in range(10_001):
     # sample a batch of data
     xb, yb = get_batch('train')
 
