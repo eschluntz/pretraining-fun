@@ -24,17 +24,17 @@ image = (
     timeout=3600,
 )
 def train_run(
-    n_embed: int = 32,
+    n_embed: int = 128,
     num_heads: int = 4,
-    n_layers: int = 3,
+    n_layers: int = 4,
     ff_expand_ratio: int = 4,
     dropout: float = 0.2,
-    block_size: int = 8,
-    batch_size: int = 16,
-    max_steps: int = 10_001,
-    eval_interval: int = 1000,
-    eval_iters: int = 200,
-    learning_rate: float = 1e-3,
+    block_size: int = 512,  # covers 95%+ of word+definition entries
+    batch_size: int = 64,
+    max_seconds: int = 1800,  # 30 minutes default
+    eval_interval_seconds: int = 60,
+    eval_iters: int = 50,
+    learning_rate: float = 3e-4,
     run_name: str = None,
 ):
     import sys
@@ -124,30 +124,56 @@ def train_run(
             "dropout": dropout,
             "block_size": block_size,
             "batch_size": batch_size,
-            "max_steps": max_steps,
+            "max_seconds": max_seconds,
             "learning_rate": learning_rate,
             "num_params": num_params,
             "vocab_size": vocab_size,
         },
     )
 
-    # Training loop
+    # Training loop (time-based)
+    import time
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
-    for step in range(max_steps):
+    # Warmup: linearly ramp LR over first 10% of training time
+    warmup_seconds = max_seconds * 0.1
+
+    start_time = time.time()
+    last_eval_time = start_time
+    step = 0
+
+    while True:
+        elapsed = time.time() - start_time
+        if elapsed >= max_seconds:
+            break
+
+        # Linear warmup, then constant (could add cosine decay here later)
+        if elapsed < warmup_seconds:
+            lr_scale = elapsed / warmup_seconds
+        else:
+            lr_scale = 1.0
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = learning_rate * lr_scale
+
         xb, yb = get_batch("train")
         _, loss = model(xb, yb)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
+        step += 1
 
-        if step % eval_interval == 0:
+        # Eval based on time, not steps
+        if time.time() - last_eval_time >= eval_interval_seconds:
+            last_eval_time = time.time()
             losses = estimate_loss(model)
-            print(f"step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            elapsed = time.time() - start_time
+            print(f"[{elapsed:.0f}s] step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
             wandb.log({
                 "train_loss": losses["train"],
                 "val_loss": losses["val"],
                 "step": step,
+                "elapsed_seconds": elapsed,
+                "learning_rate": optimizer.param_groups[0]['lr'],
                 "gpu_memory_gb": torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0,
             })
 
@@ -168,6 +194,7 @@ def train_run(
         "final_train_loss": final_losses["train"],
         "final_val_loss": final_losses["val"],
         "num_params": num_params,
+        "total_steps": step,
     }
 
 
@@ -178,29 +205,26 @@ def main():
     print(f"Result: {result}")
 
 
-@app.function(image=image)
+@app.function(image=image, timeout=7200)  # 2 hours for sweep coordinator
 def sweep():
-    """Run a parallel sweep over model configurations."""
+    """Run a parallel sweep over model sizes (all trained for same wall-clock time)."""
     configs = [
-        # Vary model depth
-        {"n_embed": 256, "num_heads": 4, "n_layers": 2, "run_name": "depth_2"},
-        {"n_embed": 256, "num_heads": 4, "n_layers": 4, "run_name": "depth_4"},
-        {"n_embed": 256, "num_heads": 4, "n_layers": 6, "run_name": "depth_6"},
-        {"n_embed": 256, "num_heads": 4, "n_layers": 8, "run_name": "depth_8"},
-        # Vary model width
-        {"n_embed": 128, "num_heads": 4, "n_layers": 4, "run_name": "width_128"},
-        {"n_embed": 256, "num_heads": 4, "n_layers": 4, "run_name": "width_256"},
-        {"n_embed": 384, "num_heads": 6, "n_layers": 4, "run_name": "width_384"},
-        {"n_embed": 512, "num_heads": 8, "n_layers": 4, "run_name": "width_512"},
+        # Scaling model size (width + depth together)
+        {"n_embed": 64,  "num_heads": 4,  "n_layers": 2,  "run_name": "size_tiny"},
+        {"n_embed": 128, "num_heads": 4,  "n_layers": 4,  "run_name": "size_small"},
+        {"n_embed": 256, "num_heads": 8,  "n_layers": 6,  "run_name": "size_medium"},
+        {"n_embed": 384, "num_heads": 12, "n_layers": 8,  "run_name": "size_large"},
+        {"n_embed": 512, "num_heads": 16, "n_layers": 10, "run_name": "size_xl"},
     ]
 
     # Launch all experiments in parallel
-    results = list(train_run.starmap([(c,) for c in configs], kwargs=configs))
+    handles = [train_run.spawn(**config) for config in configs]
+    results = [h.get() for h in handles]
 
     print("\n" + "=" * 60)
-    print("SWEEP RESULTS")
+    print("SWEEP RESULTS (sorted by val_loss)")
     print("=" * 60)
-    for r in results:
-        print(f"{r['run_name']:20s} | params: {r['num_params']:>10,} | val_loss: {r['final_val_loss']:.4f}")
+    for r in sorted(results, key=lambda x: x["final_val_loss"]):
+        print(f"{r['run_name']:20s} | params: {r['num_params']:>10,} | steps: {r['total_steps']:>6,} | val_loss: {r['final_val_loss']:.4f}")
 
     return results

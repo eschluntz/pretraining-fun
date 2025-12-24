@@ -16,26 +16,26 @@ def_lengths = [len(d) for d in sample["definition"]]
 up_votes = sample["up_votes"]
 down_votes = sample["down_votes"]
 
-# fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
 
-# axes[0, 0].hist(word_lengths, bins=50)
-# axes[0, 0].set_title("Word Length Distribution")
-# axes[0, 0].set_xlabel("Characters")
+axes[0, 0].hist(word_lengths, bins=50)
+axes[0, 0].set_title("Word Length Distribution")
+axes[0, 0].set_xlabel("Characters")
 
-# axes[0, 1].hist(def_lengths, bins=50)
-# axes[0, 1].set_title("Definition Length Distribution")
-# axes[0, 1].set_xlabel("Characters")
+axes[0, 1].hist(def_lengths, bins=50)
+axes[0, 1].set_title("Definition Length Distribution")
+axes[0, 1].set_xlabel("Characters")
 
-# axes[1, 0].hist(up_votes, bins=50)
-# axes[1, 0].set_title("Up Votes Distribution")
-# axes[1, 0].set_xlabel("Votes")
+axes[1, 0].hist(up_votes, bins=50)
+axes[1, 0].set_title("Up Votes Distribution")
+axes[1, 0].set_xlabel("Votes")
 
-# axes[1, 1].hist(down_votes, bins=50)
-# axes[1, 1].set_title("Down Votes Distribution")
-# axes[1, 1].set_xlabel("Votes")
+axes[1, 1].hist(down_votes, bins=50)
+axes[1, 1].set_title("Down Votes Distribution")
+axes[1, 1].set_xlabel("Votes")
 
-# plt.tight_layout()
-# plt.show()
+plt.tight_layout()
+plt.show()
 
 print(f"Word length: mean={sum(word_lengths)/len(word_lengths):.1f}, max={max(word_lengths)}")
 print(f"Def length: mean={sum(def_lengths)/len(def_lengths):.1f}, max={max(def_lengths)}")
@@ -73,5 +73,3 @@ itos = {i: ch for i, ch in enumerate(chars)}
 
 def encode(s): return [stoi[c] for c in s]
 def decode(toks): return "".join([itos[i] for i in toks])
-
-print(f"{encode('\n')=}")
