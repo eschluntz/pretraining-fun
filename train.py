@@ -2,8 +2,8 @@
 Modal-based training script for running parallel experiments.
 
 Usage:
-    modal run 06_train.py              # run default config
-    modal run 06_train.py::sweep       # run parallel sweep
+    modal run train.py::train_run --run-name my_run --n-embed 256
+    modal run train.py::sweep
 """
 import modal
 
@@ -14,25 +14,30 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("torch", "wandb", "numpy")
     .add_local_file("model.py", "/root/model.py")
+    .add_local_file("data.py", "/root/data.py")
     .add_local_file("data/urbandict_corpus.txt", "/data/corpus.txt")
 )
+
+# Volume for checkpoints (persists across runs)
+checkpoint_volume = modal.Volume.from_name("transformer-checkpoints", create_if_missing=True)
 
 @app.function(
     gpu="T4",
     image=image,
     secrets=[modal.Secret.from_name("wandb-secret")],
-    timeout=3600,
+    volumes={"/checkpoints": checkpoint_volume},
+    timeout=9000,  # 2.5 hours (2hr runs + 30min buffer)
 )
 def train_run(
     n_embed: int = 128,
     num_heads: int = 4,
     n_layers: int = 4,
     ff_expand_ratio: int = 4,
-    dropout: float = 0.2,
+    dropout: float = 0.05,
     block_size: int = 512,  # covers 95%+ of word+definition entries
     batch_size: int = 64,
     max_seconds: int = 1800,  # 30 minutes default
-    eval_interval_seconds: int = 60,
+    eval_interval_seconds: int = 120,
     eval_iters: int = 50,
     learning_rate: float = 3e-4,
     run_name: str = None,
@@ -40,34 +45,18 @@ def train_run(
     import sys
     sys.path.insert(0, "/root")
 
+    import os
+    import time
     import torch
     import wandb
     from model import Transformer, TransformerConfig
+    from data import load_char_data
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # Load and prepare data
-    with open("/data/corpus.txt", "r", encoding="utf-8") as f:
-        corpus = f.read()
-
-    chars = sorted(list(set(corpus)))
-    vocab_size = len(chars)
-    stoi = {ch: i for i, ch in enumerate(chars)}
-    itos = {i: ch for i, ch in enumerate(chars)}
-
-    def encode(s):
-        return [stoi[c] for c in s]
-
-    def decode(toks):
-        return "".join([itos[i] for i in toks])
-
-    data = torch.tensor(encode(corpus), dtype=torch.long)
-    n = int(0.95 * len(data))
-    train_data = data[:n]
-    val_data = data[n:]
-
-    print(f"Vocab size: {vocab_size}, Train tokens: {len(train_data):,}, Val tokens: {len(val_data):,}")
+    # Load data
+    train_data, val_data, vocab_size, _encode, decode = load_char_data("/data/corpus.txt")
 
     # Batching
     def get_batch(split):
@@ -104,52 +93,68 @@ def train_run(
 
     model = Transformer(config)
     model = model.to(device)
-    model = torch.compile(model)
 
     num_params = sum(p.numel() for p in model.parameters())
-    print(f"Model has {num_params:,} parameters")
 
-    # Wandb setup
+    # Set default run_name if not provided
     if run_name is None:
-        run_name = f"e{n_embed}_h{num_heads}_l{n_layers}"
+        run_name = config.default_run_name()
 
+    print(f"[{run_name}] Model has {num_params:,} parameters")
+    checkpoint_path = f"/checkpoints/{run_name}.pt"
+
+    # Training state
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    step = 0
+    elapsed_before = 0.0  # time spent in previous runs
+    wandb_run_id = None
+
+    # Try to load checkpoint
+    if os.path.exists(checkpoint_path):
+        print(f"Loading checkpoint from {checkpoint_path}")
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        step = ckpt["step"]
+        elapsed_before = ckpt["elapsed_seconds"]
+        wandb_run_id = ckpt.get("wandb_run_id")
+        print(f"Resumed from step {step}, {elapsed_before:.0f}s already elapsed")
+
+    # Compile after loading (compile doesn't save/load well)
+    model = torch.compile(model)
+
+    # Wandb setup (resume if we have a run_id)
     wandb.init(
         project="urban-dict-transformer",
         name=run_name,
+        id=wandb_run_id,
+        resume="allow" if wandb_run_id else None,
         config={
-            "n_embed": n_embed,
-            "num_heads": num_heads,
-            "n_layers": n_layers,
-            "ff_expand_ratio": ff_expand_ratio,
-            "dropout": dropout,
-            "block_size": block_size,
+            **config.to_dict(),  # model config
             "batch_size": batch_size,
             "max_seconds": max_seconds,
             "learning_rate": learning_rate,
             "num_params": num_params,
-            "vocab_size": vocab_size,
         },
     )
-
-    # Training loop (time-based)
-    import time
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    wandb_run_id = wandb.run.id  # save for checkpoint
 
     # Warmup: linearly ramp LR over first 10% of training time
     warmup_seconds = max_seconds * 0.1
 
     start_time = time.time()
     last_eval_time = start_time
-    step = 0
 
     while True:
-        elapsed = time.time() - start_time
-        if elapsed >= max_seconds:
+        elapsed_this_run = time.time() - start_time
+        total_elapsed = elapsed_before + elapsed_this_run
+        remaining = max_seconds - total_elapsed
+        if remaining <= 0:
             break
 
-        # Linear warmup, then constant (could add cosine decay here later)
-        if elapsed < warmup_seconds:
-            lr_scale = elapsed / warmup_seconds
+        # Linear warmup, then constant (based on total elapsed time)
+        if total_elapsed < warmup_seconds:
+            lr_scale = total_elapsed / warmup_seconds
         else:
             lr_scale = 1.0
         for param_group in optimizer.param_groups:
@@ -159,26 +164,39 @@ def train_run(
         _, loss = model(xb, yb)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         step += 1
 
-        # Eval based on time, not steps
+        # Eval and checkpoint based on time
         if time.time() - last_eval_time >= eval_interval_seconds:
             last_eval_time = time.time()
             losses = estimate_loss(model)
-            elapsed = time.time() - start_time
-            print(f"[{elapsed:.0f}s] step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            total_elapsed = elapsed_before + (time.time() - start_time)
+            print(f"[{run_name}] [{total_elapsed:.0f}s] step {step}: train {losses['train']:.4f}, val {losses['val']:.4f}")
             wandb.log({
                 "train_loss": losses["train"],
                 "val_loss": losses["val"],
                 "step": step,
-                "elapsed_seconds": elapsed,
+                "elapsed_seconds": total_elapsed,
                 "learning_rate": optimizer.param_groups[0]['lr'],
                 "gpu_memory_gb": torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0,
             })
 
+            # Save checkpoint
+            torch.save({
+                "model": model._orig_mod.state_dict(),  # unwrap compiled model
+                "optimizer": optimizer.state_dict(),
+                "step": step,
+                "elapsed_seconds": total_elapsed,
+                "wandb_run_id": wandb_run_id,
+            }, checkpoint_path)
+            checkpoint_volume.commit()
+            print(f"Checkpoint saved to {checkpoint_path}")
+
     # Final eval
     final_losses = estimate_loss(model)
+    total_elapsed = elapsed_before + (time.time() - start_time)
     print(f"Final: train loss {final_losses['train']:.4f}, val loss {final_losses['val']:.4f}")
 
     # Generate sample
@@ -186,6 +204,12 @@ def train_run(
     generated = decode(model.generate(idx, max_new_tokens=200)[0].tolist())
     print(f"\nGenerated sample:\n{generated}")
     wandb.log({"generated_sample": generated})
+
+    # Clean up checkpoint after successful completion
+    if os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+        checkpoint_volume.commit()
+        print(f"Removed checkpoint {checkpoint_path}")
 
     wandb.finish()
 
@@ -195,6 +219,7 @@ def train_run(
         "final_val_loss": final_losses["val"],
         "num_params": num_params,
         "total_steps": step,
+        "total_seconds": total_elapsed,
     }
 
 
@@ -205,16 +230,12 @@ def main():
     print(f"Result: {result}")
 
 
-@app.function(image=image, timeout=7200)  # 2 hours for sweep coordinator
+@app.function(image=image, timeout=5400)  # 1.5 hours for sweep coordinator
 def sweep():
-    """Run a parallel sweep over model sizes (all trained for same wall-clock time)."""
+    """Run a parallel sweep over learning rates on medium model."""
     configs = [
-        # Scaling model size (width + depth together)
-        {"n_embed": 64,  "num_heads": 4,  "n_layers": 2,  "run_name": "size_tiny"},
-        {"n_embed": 128, "num_heads": 4,  "n_layers": 4,  "run_name": "size_small"},
-        {"n_embed": 256, "num_heads": 8,  "n_layers": 6,  "run_name": "size_medium"},
-        {"n_embed": 384, "num_heads": 12, "n_layers": 8,  "run_name": "size_large"},
-        {"n_embed": 512, "num_heads": 16, "n_layers": 10, "run_name": "size_xl"},
+        {"n_embed": 256, "num_heads": 8, "n_layers": 6, "run_name": "lr_med_6e-3", "max_seconds": 3600, "learning_rate": 6e-3},
+        {"n_embed": 256, "num_heads": 8, "n_layers": 6, "run_name": "lr_med_1e-2", "max_seconds": 3600, "learning_rate": 1e-2},
     ]
 
     # Launch all experiments in parallel

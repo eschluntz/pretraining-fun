@@ -5,7 +5,7 @@ No global state - all config passed as constructor arguments.
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 
 
 @dataclass
@@ -17,6 +17,12 @@ class TransformerConfig:
     n_layers: int
     ff_expand_ratio: int
     dropout: float
+
+    def default_run_name(self) -> str:
+        return f"e{self.n_embed}_h{self.num_heads}_l{self.n_layers}"
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 class MultiHeadAttention(nn.Module):
