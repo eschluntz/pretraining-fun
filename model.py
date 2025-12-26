@@ -18,6 +18,7 @@ class TransformerConfig:
     ff_expand_ratio: int
     dropout: float
     tie_weights: bool = False
+    use_swiglu: bool = False  # if True, use SwiGLU instead of GELU FFN
 
     def default_run_name(self) -> str:
         return f"e{self.n_embed}_h{self.num_heads}_l{self.n_layers}"
@@ -67,7 +68,7 @@ class FeedForward(nn.Module):
         hidden_dim = config.ff_expand_ratio * config.n_embed
         self.net = nn.Sequential(
             nn.Linear(config.n_embed, hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(hidden_dim, config.n_embed),
             nn.Dropout(config.dropout),
         )
@@ -76,13 +77,29 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 
+class SwiGLU(nn.Module):
+    """SwiGLU FFN (used in LLaMA). Uses 8/3 expansion to match GELU FFN params."""
+
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        # 8/3 multiplier keeps param count similar to 4x GELU FFN
+        hidden_dim = int(config.n_embed * 8 / 3)
+        self.w_gate = nn.Linear(config.n_embed, hidden_dim, bias=False)
+        self.w_up = nn.Linear(config.n_embed, hidden_dim, bias=False)
+        self.w_down = nn.Linear(hidden_dim, config.n_embed, bias=False)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        return self.dropout(self.w_down(F.silu(self.w_gate(x)) * self.w_up(x)))
+
+
 class Block(nn.Module):
     """Transformer block: attention then feedforward with residual connections"""
 
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.attn = MultiHeadAttention(config)
-        self.ffwd = FeedForward(config)
+        self.ffwd = SwiGLU(config) if config.use_swiglu else FeedForward(config)
         self.ln1 = nn.LayerNorm(config.n_embed)
         self.ln2 = nn.LayerNorm(config.n_embed)
 

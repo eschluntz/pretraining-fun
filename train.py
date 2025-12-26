@@ -24,11 +24,11 @@ image = (
 checkpoint_volume = modal.Volume.from_name("transformer-checkpoints", create_if_missing=True)
 
 @app.function(
-    gpu="T4",
+    gpu="A10G",
     image=image,
     secrets=[modal.Secret.from_name("wandb-secret")],
     volumes={"/checkpoints": checkpoint_volume},
-    timeout=9000,  # 2.5 hours (2hr runs + 30min buffer)
+    timeout=86400,  # 24 hours (Modal max)
 )
 def train_run(
     n_embed: int = 128,
@@ -39,12 +39,15 @@ def train_run(
     block_size: int = 512,  # covers 95%+ of word+definition entries
     batch_size: int = 64,
     max_seconds: int = 1800,  # 30 minutes default
-    eval_interval_seconds: int = 120,
+    eval_interval_seconds: int = 300,  # 5 minutes
     eval_iters: int = 50,
     learning_rate: float = 3e-4,
+    warmup_steps: int = 2000,  # step-based warmup cap
+    min_lr_ratio: float = 0.1,  # cosine decay to 10% of peak LR
     run_name: str = None,
     tokenizer: str = "char",  # "char" or "tiktoken"
     tie_weights: bool = False,
+    use_swiglu: bool = False,
 ):
     import sys
     sys.path.insert(0, "/root")
@@ -58,6 +61,7 @@ def train_run(
     from data import load_char_data, load_tiktoken_data, load_sentencepiece_data
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.set_float32_matmul_precision('high')  # enable TF32 for ~2x faster matmuls
     print(f"Using device: {device}")
 
     # Load data
@@ -103,6 +107,7 @@ def train_run(
         ff_expand_ratio=ff_expand_ratio,
         dropout=dropout,
         tie_weights=tie_weights,
+        use_swiglu=use_swiglu,
     )
 
     model = Transformer(config)
@@ -155,13 +160,12 @@ def train_run(
     )
     wandb_run_id = wandb.run.id  # save for checkpoint
 
-    # Warmup: linearly ramp LR over first 10% of training time
-    warmup_seconds = max_seconds * 0.1
-
     start_time = time.time()
     last_eval_time = start_time
     eval_time_total = 0.0
     checkpoint_time_total = 0.0
+    tokens_per_step = batch_size * block_size
+    max_grad_norm = 0.0  # track max since last eval
 
     while True:
         elapsed_this_run = time.time() - start_time
@@ -170,11 +174,13 @@ def train_run(
         if remaining <= 0:
             break
 
-        # Linear warmup, then constant (based on total elapsed time)
-        if total_elapsed < warmup_seconds:
-            lr_scale = total_elapsed / warmup_seconds
+        # LR schedule: step-based warmup, then time-based cosine decay
+        if step < warmup_steps:
+            lr_scale = step / warmup_steps
         else:
-            lr_scale = 1.0
+            # Cosine decay based on time (0 at start, 1 at max_seconds)
+            progress = min(total_elapsed / max_seconds, 1.0)
+            lr_scale = min_lr_ratio + 0.5 * (1 - min_lr_ratio) * (1 + math.cos(math.pi * progress))
         for param_group in optimizer.param_groups:
             param_group['lr'] = learning_rate * lr_scale
 
@@ -182,7 +188,8 @@ def train_run(
         _, loss = model(xb, yb)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        max_grad_norm = max(max_grad_norm, grad_norm.item())
         optimizer.step()
         step += 1
 
@@ -191,30 +198,40 @@ def train_run(
             last_eval_time = time.time()
 
             eval_start = time.time()
-            losses = estimate_loss(model, splits=("train",))
+            losses = estimate_loss(model, splits=("train", "val"))
             eval_time_total += time.time() - eval_start
 
             total_elapsed = elapsed_before + (time.time() - start_time)
             train_bpc = losses["train"] / (chars_per_token * math.log(2))
-            print(f"[{run_name}] [{total_elapsed:.0f}s] step {step}: train {losses['train']:.4f} bpc {train_bpc:.4f}")
+            val_bpc = losses["val"] / (chars_per_token * math.log(2))
+            total_tokens = step * tokens_per_step
+            print(f"[{run_name}] [{total_elapsed:.0f}s] step {step}: train {losses['train']:.4f} val {losses['val']:.4f} bpc {val_bpc:.4f}")
             wandb.log({
                 "train_loss": losses["train"],
                 "train_bpc": train_bpc,
+                "val_loss": losses["val"],
+                "val_bpc": val_bpc,
                 "step": step,
+                "total_tokens": total_tokens,
+                "epochs": total_tokens / len(train_data),
                 "elapsed_seconds": total_elapsed,
                 "learning_rate": optimizer.param_groups[0]['lr'],
                 "gpu_memory_gb": torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0,
+                "max_grad_norm": max_grad_norm,
             })
+            max_grad_norm = 0.0  # reset for next interval
 
-            # Save checkpoint
+            # Save checkpoint atomically (write to temp, then rename)
             ckpt_start = time.time()
+            tmp_path = checkpoint_path + ".tmp"
             torch.save({
                 "model": model._orig_mod.state_dict(),  # unwrap compiled model
                 "optimizer": optimizer.state_dict(),
                 "step": step,
                 "elapsed_seconds": total_elapsed,
                 "wandb_run_id": wandb_run_id,
-            }, checkpoint_path)
+            }, tmp_path)
+            os.replace(tmp_path, checkpoint_path)  # atomic on POSIX
             checkpoint_volume.commit()
             checkpoint_time_total += time.time() - ckpt_start
             print(f"Checkpoint saved to {checkpoint_path}")
@@ -224,7 +241,7 @@ def train_run(
     total_elapsed = elapsed_before + (time.time() - start_time)
     train_bpc = final_losses["train"] / (chars_per_token * math.log(2))
     val_bpc = final_losses["val"] / (chars_per_token * math.log(2))
-    print(f"Final: {run_name}train loss {final_losses['train']:.4f} (bpc {train_bpc:.4f}), val loss {final_losses['val']:.4f} (bpc {val_bpc:.4f})")
+    print(f"Final: [{run_name}] train loss {final_losses['train']:.4f} (bpc {train_bpc:.4f}), val loss {final_losses['val']:.4f} (bpc {val_bpc:.4f})")
     wandb.log({
         "train_loss": final_losses["train"],
         "train_bpc": train_bpc,
@@ -235,7 +252,7 @@ def train_run(
 
     # Timing breakdown
     train_time = total_elapsed - eval_time_total - checkpoint_time_total
-    print(f"\nTiming breakdown:")
+    print("\nTiming breakdown:")
     print(f"  Training:     {train_time:.1f}s ({100*train_time/total_elapsed:.1f}%)")
     print(f"  Eval:         {eval_time_total:.1f}s ({100*eval_time_total/total_elapsed:.1f}%)")
     print(f"  Checkpoint:   {checkpoint_time_total:.1f}s ({100*checkpoint_time_total/total_elapsed:.1f}%)")
@@ -246,11 +263,8 @@ def train_run(
     print(f"\nGenerated sample:\n{generated}")
     wandb.log({"generated_sample": generated})
 
-    # Clean up checkpoint after successful completion
-    if os.path.exists(checkpoint_path):
-        os.remove(checkpoint_path)
-        checkpoint_volume.commit()
-        print(f"Removed checkpoint {checkpoint_path}")
+    # Keep checkpoint for potential further training or analysis
+    print(f"Final checkpoint saved at {checkpoint_path}")
 
     wandb.finish()
 
@@ -273,47 +287,63 @@ def main():
     print(f"Result: {result}")
 
 
-@app.function(image=image, timeout=5400)  # 1.5hr buffer
+@app.function(image=image, timeout=86400)
 def sweep():
-    """Small vocab BPE tokenization sweep."""
+    """24hr scaling experiment: 10M to 100M models."""
+    # Common settings
+    common = {
+        "tokenizer": "tiktoken",
+        "tie_weights": True,
+        "dropout": 0.1,
+        "block_size": 64,
+        "batch_size": 64,
+        "max_seconds": 85800,  # 23hr 50min (buffer for clean shutdown)
+    }
+
     configs = [
-        # BPE 500 vocab - block_size=112 → ~252 chars (matches char baseline)
-        {"n_embed": 256, "num_heads": 8, "n_layers": 6, "block_size": 112,
-         "run_name": "bpe500_match", "tokenizer": "bpe500", "tie_weights": True,
-         "max_seconds": 3600, "learning_rate": 3e-3, "batch_size": 64},
+        # 10M - safe anchor, known-good baseline
+        {"n_embed": 192, "num_heads": 3, "n_layers": 4,
+         "run_name": "scale_10m", "learning_rate": 3e-3, **common},
 
-        {"n_embed": 256, "num_heads": 8, "n_layers": 8, "block_size": 112,
-         "run_name": "bpe500_deep", "tokenizer": "bpe500", "tie_weights": True,
-         "max_seconds": 3600, "learning_rate": 3e-3, "batch_size": 64},
+        # 25M - conservative scale-up
+        {"n_embed": 320, "num_heads": 5, "n_layers": 6,
+         "run_name": "scale_25m", "learning_rate": 2e-3, **common},
 
-        {"n_embed": 320, "num_heads": 8, "n_layers": 6, "block_size": 112,
-         "run_name": "bpe500_wide", "tokenizer": "bpe500", "tie_weights": True,
-         "max_seconds": 3600, "learning_rate": 3e-3, "batch_size": 64},
+        # 50M - sweet spot (GPT-2 proportions)
+        {"n_embed": 512, "num_heads": 8, "n_layers": 8,
+         "run_name": "scale_50m", "learning_rate": 1.5e-3, **common},
 
-        # BPE 1000 vocab - block_size=96 → ~253 chars (matches char baseline)
-        {"n_embed": 256, "num_heads": 8, "n_layers": 6, "block_size": 96,
-         "run_name": "bpe1k_match", "tokenizer": "bpe1k", "tie_weights": True,
-         "max_seconds": 3600, "learning_rate": 3e-3, "batch_size": 64},
+        # 100M - ambitious
+        {"n_embed": 768, "num_heads": 12, "n_layers": 10,
+         "run_name": "scale_100m", "learning_rate": 1e-3, **common},
 
-        {"n_embed": 256, "num_heads": 8, "n_layers": 8, "block_size": 96,
-         "run_name": "bpe1k_deep", "tokenizer": "bpe1k", "tie_weights": True,
-         "max_seconds": 3600, "learning_rate": 3e-3, "batch_size": 64},
-
-        {"n_embed": 320, "num_heads": 8, "n_layers": 6, "block_size": 96,
-         "run_name": "bpe1k_wide", "tokenizer": "bpe1k", "tie_weights": True,
-         "max_seconds": 3600, "learning_rate": 3e-3, "batch_size": 64},
+        # 50M with SwiGLU (LLaMA-style FFN)
+        {"n_embed": 512, "num_heads": 8, "n_layers": 8,
+         "run_name": "scale_50m_swiglu", "learning_rate": 1.5e-3, "use_swiglu": True, **common},
     ]
 
     # Launch all experiments in parallel
-    handles = [train_run.spawn(**config) for config in configs]
-    results = [h.get() for h in handles]
+    handles = [(config["run_name"], train_run.spawn(**config)) for config in configs]
+
+    results = []
+    errors = []
+    for run_name, h in handles:
+        try:
+            results.append(h.get())
+        except Exception as e:
+            errors.append((run_name, str(e)))
+            print(f"[{run_name}] FAILED: {e}")
 
     print("\n" + "=" * 70)
     print("SWEEP RESULTS (sorted by val_bpc)")
     print("=" * 70)
-    print("Baselines: char-level 1.75 BPC | gpt2_8m 1.66 BPC")
     print("-" * 70)
     for r in sorted(results, key=lambda x: x["final_val_bpc"]):
         print(f"{r['run_name']:15s} | params: {r['num_params']:>10,} | steps: {r['total_steps']:>6,} | train_bpc: {r['final_train_bpc']:.4f} | val_bpc: {r['final_val_bpc']:.4f}")
+
+    if errors:
+        print("\nFAILED RUNS:")
+        for run_name, err in errors:
+            print(f"  {run_name}: {err}")
 
     return results
