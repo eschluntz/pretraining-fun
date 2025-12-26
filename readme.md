@@ -186,12 +186,112 @@ Entries fitting in each block_size:
 - ctx_128 is too aggressive — truncation hurts more than extra data helps
 - Sticking with block_size=256 for future experiments (lower memory, same quality)
 
+## 7: Tokenization — Char-level vs GPT-2 Tiktoken
+
+**Question:** Does subword tokenization beat char-level at equal parameter count and training time?
+
+**Metric: Bits Per Character (BPC)**
+
+Cross-entropy loss measures bits per token, but tokens have different granularities. BPC normalizes to bits per character for fair comparison:
+
+```
+BPC = loss / (chars_per_token * ln(2))
+```
+
+- Char-level: `chars_per_token = 1.0`
+- GPT-2 tiktoken: `chars_per_token ≈ 4.11`
+
+**Corpus stats:**
+- 479M chars → 117M GPT-2 tokens
+- 4.11 chars/token compression
+- 97% of GPT-2 vocab used (48,826 / 50,257)
+
+**Baseline (char-level):**
+| Run | Tokenizer | n_embed | heads | layers | block_size | Params | Val Loss | BPC |
+|-----|-----------|---------|-------|--------|------------|--------|----------|-----|
+| medium | char | 256 | 8 | 6 | 256 | 5M | 1.21 | 1.75 |
+
+**Target to beat: 1.75 BPC**
+
+**GPT-2 Tiktoken Sweep:**
+
+All runs use `tie_weights=True` — shares embedding and lm_head weights. Critical for large vocab: with 50K vocab and n_embed=80, embedding alone is 4M params. Tying cuts that in half.
+| Run         | n_embed | heads | layers | block_size | ~Params | Notes                          |
+|-------------|---------|-------|--------|------------|---------|--------------------------------|
+| gpt2_5m     | 80      | 4     | 10     | 64         | 4.9M    | Match ~5M param count          |
+| gpt2_wide   | 96      | 6     | 6      | 64         | 5.6M    | Wider, shallower               |
+| gpt2_ctx128 | 72      | 4     | 8      | 128        | 4.2M    | 2x context (512 chars effective) |
+| gpt2_deep   | 64      | 4     | 12     | 64         | 3.9M    | Deep & narrow                  |
+| gpt2_ctx256 | 64      | 4     | 8      | 256        | 3.7M    | 4x context (1K chars effective) |
+| gpt2_small  | 48      | 4     | 6      | 128        | 2.6M    | Smallest model                 |
+| gpt2_6m     | 104     | 4     | 8      | 128        | 6.3M    | Larger than baseline           |
+| gpt2_8m     | 128     | 8     | 8      | 128        | 8.1M    | Largest model                  |
+
+**Held constant:**
+- batch_size=64, lr=3e-3, dropout=0.05, ff_ratio=4
+- Training time: 60 min each
+- GPU: T4
+
+**Success criteria:**
+- GPT-2 wins if any run achieves < 1.75 BPC
+- Char-level wins if all GPT-2 runs >= 1.75 BPC
+
+**Results:**
+
+| Run         | Params | Steps  | Train BPC | Val BPC   | vs 1.75 |
+|-------------|--------|--------|-----------|-----------|---------|
+| gpt2_8m     | 8.1M   | 18,359 | 1.641     | **1.658** | -5.3%   |
+| gpt2_6m     | 6.3M   | 20,442 | 1.662     | **1.674** | -4.4%   |
+| gpt2_wide   | 5.6M   | 44,174 | 1.676     | **1.686** | -3.7%   |
+| gpt2_5m     | 4.9M   | 43,617 | 1.682     | **1.687** | -3.6%   |
+| gpt2_deep   | 3.9M   | 54,167 | 1.702     | **1.720** | -1.7%   |
+| gpt2_ctx128 | 4.2M   | 22,423 | 1.724     | **1.725** | -1.5%   |
+| gpt2_ctx256 | 3.7M   | 12,405 | 1.770     | 1.772     | +1.3%   |
+| gpt2_small  | 2.6M   | 31,443 | 1.783     | 1.790     | +2.3%   |
+
+**Winner: GPT-2 tiktoken** — 6 of 8 configs beat the 1.75 BPC char-level baseline.
+
+**Observations:**
+- **More params help** — larger models beat baseline despite 50K vocab embedding overhead
+- **Short context wins** — block_size=64 beats 128/256 at similar param counts; small models can't use long context effectively
+- **Depth helps** — gpt2_deep (12 layers) beats gpt2_ctx128 (8 layers) despite fewer params
+- **Throughput tradeoff** — short-context models got 2-4x more steps in the same hour
+
+---
+
+### Small-Vocab BPE Experiment
+
+**Question:** Can small-vocab BPE get compression benefits without the embedding overhead of GPT-2's 50K vocab?
+
+Trained custom BPE tokenizers on the corpus:
+- **bpe500**: 500 vocab, 2.25 chars/token compression
+- **bpe1k**: 1000 vocab, 2.64 chars/token compression
+
+With tiny vocab, embedding overhead is negligible → can use large n_embed (256-320) like char-level.
+
+Block sizes chosen to match ~256 char effective context:
+- bpe500: block_size=112 → 252 chars
+- bpe1k: block_size=96 → 253 chars
+| Run          | Vocab | n_embed | layers | block_size | Params | Train BPC | Val BPC   | vs 1.75 |
+|--------------|-------|---------|--------|------------|--------|-----------|-----------|---------|
+| bpe1k_match  | 1000  | 256     | 6      | 96         | 5.0M   | 1.666     | **1.675** | -4.3%   |
+| bpe500_wide  | 500   | 320     | 6      | 112        | 7.6M   | 1.679     | **1.681** | -3.9%   |
+| bpe500_deep  | 500   | 256     | 8      | 112        | 6.5M   | 1.677     | **1.683** | -3.8%   |
+| bpe500_match | 500   | 256     | 6      | 112        | 4.9M   | 1.680     | **1.687** | -3.6%   |
+| bpe1k_wide   | 1000  | 320     | 6      | 96         | 7.7M   | 1.658     | (timeout) | —       |
+
+**Result:** bpe1k_match (5M params, 1.675 val BPC) is close to gpt2_8m (8.1M params, 1.658 val BPC)
+
+**Qualitative Generation Results**
+From reading some of the outputs, i think the tiktoken runs produced the best outputs. I trust that more than the BPC comparisons for my purposes!
+
 # Future planned experiments
 [x] Learning Rate
 [x] LR + Batch size
 [ ] FFN vs Attention Ratio
 [ ] Depth vs Width
 [x] Context length
-[ ] tokenization
+[x] Tokenization
+[ ] non-linearity: ReLU vs GeLU vs SWiGLU
 
 For all of these, I should try doing small scale experiments and try to extrapolate what it means at a larger scale, then check those results!

@@ -17,6 +17,7 @@ class TransformerConfig:
     n_layers: int
     ff_expand_ratio: int
     dropout: float
+    tie_weights: bool = False
 
     def default_run_name(self) -> str:
         return f"e{self.n_embed}_h{self.num_heads}_l{self.n_layers}"
@@ -104,6 +105,9 @@ class Transformer(nn.Module):
         self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layers)])
         self.ln_f = nn.LayerNorm(config.n_embed)
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size)
+
+        if config.tie_weights:
+            self.lm_head.weight = self.token_embedding.weight
 
     def forward(self, idx, targets=None):
         B, T = idx.shape

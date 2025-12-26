@@ -12,10 +12,12 @@ app = modal.App("urban-dict-transformer")
 # Container image with dependencies and data baked in
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("torch", "wandb", "numpy")
+    .pip_install("torch", "wandb", "numpy", "tiktoken", "sentencepiece")
     .add_local_file("model.py", "/root/model.py")
     .add_local_file("data.py", "/root/data.py")
     .add_local_file("data/urbandict_corpus.txt", "/data/corpus.txt")
+    .add_local_file("tokenizers/bpe_500.model", "/data/bpe_500.model")
+    .add_local_file("tokenizers/bpe_1000.model", "/data/bpe_1000.model")
 )
 
 # Volume for checkpoints (persists across runs)
@@ -41,22 +43,33 @@ def train_run(
     eval_iters: int = 50,
     learning_rate: float = 3e-4,
     run_name: str = None,
+    tokenizer: str = "char",  # "char" or "tiktoken"
+    tie_weights: bool = False,
 ):
     import sys
     sys.path.insert(0, "/root")
 
     import os
     import time
+    import math
     import torch
     import wandb
     from model import Transformer, TransformerConfig
-    from data import load_char_data
+    from data import load_char_data, load_tiktoken_data, load_sentencepiece_data
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
     # Load data
-    train_data, val_data, vocab_size, _encode, decode = load_char_data("/data/corpus.txt")
+    if tokenizer == "tiktoken":
+        train_data, val_data, vocab_size, _encode, decode, chars_per_token = load_tiktoken_data("/data/corpus.txt")
+    elif tokenizer == "bpe500":
+        train_data, val_data, vocab_size, _encode, decode, chars_per_token = load_sentencepiece_data("/data/corpus.txt", "/data/bpe_500.model")
+    elif tokenizer == "bpe1k":
+        train_data, val_data, vocab_size, _encode, decode, chars_per_token = load_sentencepiece_data("/data/corpus.txt", "/data/bpe_1000.model")
+    else:
+        train_data, val_data, vocab_size, _encode, decode = load_char_data("/data/corpus.txt")
+        chars_per_token = 1.0
 
     # Batching
     def get_batch(split):
@@ -89,6 +102,7 @@ def train_run(
         n_layers=n_layers,
         ff_expand_ratio=ff_expand_ratio,
         dropout=dropout,
+        tie_weights=tie_weights,
     )
 
     model = Transformer(config)
@@ -135,6 +149,8 @@ def train_run(
             "max_seconds": max_seconds,
             "learning_rate": learning_rate,
             "num_params": num_params,
+            "tokenizer": tokenizer,
+            "chars_per_token": chars_per_token,
         },
     )
     wandb_run_id = wandb.run.id  # save for checkpoint
@@ -179,9 +195,11 @@ def train_run(
             eval_time_total += time.time() - eval_start
 
             total_elapsed = elapsed_before + (time.time() - start_time)
-            print(f"[{run_name}] [{total_elapsed:.0f}s] step {step}: train {losses['train']:.4f}")
+            train_bpc = losses["train"] / (chars_per_token * math.log(2))
+            print(f"[{run_name}] [{total_elapsed:.0f}s] step {step}: train {losses['train']:.4f} bpc {train_bpc:.4f}")
             wandb.log({
                 "train_loss": losses["train"],
+                "train_bpc": train_bpc,
                 "step": step,
                 "elapsed_seconds": total_elapsed,
                 "learning_rate": optimizer.param_groups[0]['lr'],
@@ -204,8 +222,16 @@ def train_run(
     # Final eval (includes val)
     final_losses = estimate_loss(model)
     total_elapsed = elapsed_before + (time.time() - start_time)
-    print(f"Final: train loss {final_losses['train']:.4f}, val loss {final_losses['val']:.4f}")
-    wandb.log({"train_loss": final_losses["train"], "val_loss": final_losses["val"], "step": step})
+    train_bpc = final_losses["train"] / (chars_per_token * math.log(2))
+    val_bpc = final_losses["val"] / (chars_per_token * math.log(2))
+    print(f"Final: {run_name}train loss {final_losses['train']:.4f} (bpc {train_bpc:.4f}), val loss {final_losses['val']:.4f} (bpc {val_bpc:.4f})")
+    wandb.log({
+        "train_loss": final_losses["train"],
+        "train_bpc": train_bpc,
+        "val_loss": final_losses["val"],
+        "val_bpc": val_bpc,
+        "step": step,
+    })
 
     # Timing breakdown
     train_time = total_elapsed - eval_time_total - checkpoint_time_total
@@ -232,6 +258,8 @@ def train_run(
         "run_name": run_name,
         "final_train_loss": final_losses["train"],
         "final_val_loss": final_losses["val"],
+        "final_train_bpc": train_bpc,
+        "final_val_bpc": val_bpc,
         "num_params": num_params,
         "total_steps": step,
         "total_seconds": total_elapsed,
@@ -247,22 +275,45 @@ def main():
 
 @app.function(image=image, timeout=5400)  # 1.5hr buffer
 def sweep():
-    """Context length sweep on medium model."""
+    """Small vocab BPE tokenization sweep."""
     configs = [
-        {"n_embed": 256, "num_heads": 8, "n_layers": 6, "run_name": "ctx_128", "max_seconds": 3600, "batch_size": 64, "block_size": 128, "learning_rate": 3e-3},
-        {"n_embed": 256, "num_heads": 8, "n_layers": 6, "run_name": "ctx_256", "max_seconds": 3600, "batch_size": 64, "block_size": 256, "learning_rate": 3e-3},
-        {"n_embed": 256, "num_heads": 8, "n_layers": 6, "run_name": "ctx_384", "max_seconds": 3600, "batch_size": 64, "block_size": 384, "learning_rate": 3e-3},
-        {"n_embed": 256, "num_heads": 8, "n_layers": 6, "run_name": "ctx_512", "max_seconds": 3600, "batch_size": 64, "block_size": 512, "learning_rate": 3e-3},
+        # BPE 500 vocab - block_size=112 → ~252 chars (matches char baseline)
+        {"n_embed": 256, "num_heads": 8, "n_layers": 6, "block_size": 112,
+         "run_name": "bpe500_match", "tokenizer": "bpe500", "tie_weights": True,
+         "max_seconds": 3600, "learning_rate": 3e-3, "batch_size": 64},
+
+        {"n_embed": 256, "num_heads": 8, "n_layers": 8, "block_size": 112,
+         "run_name": "bpe500_deep", "tokenizer": "bpe500", "tie_weights": True,
+         "max_seconds": 3600, "learning_rate": 3e-3, "batch_size": 64},
+
+        {"n_embed": 320, "num_heads": 8, "n_layers": 6, "block_size": 112,
+         "run_name": "bpe500_wide", "tokenizer": "bpe500", "tie_weights": True,
+         "max_seconds": 3600, "learning_rate": 3e-3, "batch_size": 64},
+
+        # BPE 1000 vocab - block_size=96 → ~253 chars (matches char baseline)
+        {"n_embed": 256, "num_heads": 8, "n_layers": 6, "block_size": 96,
+         "run_name": "bpe1k_match", "tokenizer": "bpe1k", "tie_weights": True,
+         "max_seconds": 3600, "learning_rate": 3e-3, "batch_size": 64},
+
+        {"n_embed": 256, "num_heads": 8, "n_layers": 8, "block_size": 96,
+         "run_name": "bpe1k_deep", "tokenizer": "bpe1k", "tie_weights": True,
+         "max_seconds": 3600, "learning_rate": 3e-3, "batch_size": 64},
+
+        {"n_embed": 320, "num_heads": 8, "n_layers": 6, "block_size": 96,
+         "run_name": "bpe1k_wide", "tokenizer": "bpe1k", "tie_weights": True,
+         "max_seconds": 3600, "learning_rate": 3e-3, "batch_size": 64},
     ]
 
     # Launch all experiments in parallel
     handles = [train_run.spawn(**config) for config in configs]
     results = [h.get() for h in handles]
 
-    print("\n" + "=" * 60)
-    print("SWEEP RESULTS (sorted by val_loss)")
-    print("=" * 60)
-    for r in sorted(results, key=lambda x: x["final_val_loss"]):
-        print(f"{r['run_name']:20s} | params: {r['num_params']:>10,} | steps: {r['total_steps']:>6,} | val_loss: {r['final_val_loss']:.4f}")
+    print("\n" + "=" * 70)
+    print("SWEEP RESULTS (sorted by val_bpc)")
+    print("=" * 70)
+    print("Baselines: char-level 1.75 BPC | gpt2_8m 1.66 BPC")
+    print("-" * 70)
+    for r in sorted(results, key=lambda x: x["final_val_bpc"]):
+        print(f"{r['run_name']:15s} | params: {r['num_params']:>10,} | steps: {r['total_steps']:>6,} | train_bpc: {r['final_train_bpc']:.4f} | val_bpc: {r['final_val_bpc']:.4f}")
 
     return results
