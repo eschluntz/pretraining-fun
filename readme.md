@@ -63,7 +63,7 @@ large: 1.4
 I think medium is going to be my experiment workhorse.
 
 
-## Learning Rate Experiment for Medium model
+## 4: Learning Rate Experiment for Medium model
 
 **Medium Model params:**
 | Name   | n_embed | heads | layers | ~Params |
@@ -71,7 +71,9 @@ I think medium is going to be my experiment workhorse.
 | medium | 256     | 8     | 6      | 5M      |
 
 **Held constant:**
-TODO
+- block_size=512, batch_size=64, dropout=0.05, ff_ratio=4
+- Training time: 60 min each
+- GPU: T4
 
 
 | Run Name | Params | Steps | Val Loss |
@@ -101,12 +103,95 @@ Investigating the slow runs on wandb, I can clearly see that they had lower `GPU
 
 For any experiments that should be iso-compute I can just run based on number of steps, but for comparing across sizes, this will be trickier. I also checked my size experiments and there was +/- 10% clock speed, but not enough to make a serious difference.
 
+## 5: Batch Size + LR Scaling
+
+**Question:** What batch size trains fastest for the medium model? Does sqrt-scaled LR work, or does batch_256 need a different LR?
+
+**Model:** medium (5M params)
+
+**Varied params:**
+| Batch Size | Learning Rate | Notes                        | Val Loss |
+|------------|---------------|------------------------------|----------|
+| 64         | 3e-3          | baseline                     | 1.210    |
+| 128        | 4.2e-3        | 3e-3 × √2                    | 1.210    |
+| 256        | 3e-3          | no LR scaling                | 1.288    |
+| 256        | 6e-3          | 3e-3 × √4 (sqrt scaling)     | 1.251    |
+| 256        | 9e-3          | 1.5x sqrt scaling            | 1.228    |
+| 256        | 1.2e-2        | linear scaling               | 1.243    |
+| 512        | 8.5e-3        | OOM                          | -        |
+
+**Held constant:**
+- block_size=512, dropout=0.05, ff_ratio=4
+- Training time: 60 min each
+- GPU: T4
+- Only eval on train set during training (val at end) to reduce overhead
+
+**Results:**
+
+batch_64 and batch_128 tied at 1.210 — doubling batch size with sqrt-scaled LR gives identical results.
+
+batch_256's best LR was 9e-3 (between sqrt and linear scaling), but still slightly worse at 1.228.
+
+**Conclusion:** For this 5M model, we hit diminishing returns around batch_128. Larger batches don't improve training speed — likely hitting the critical batch size. Stick with batch_64 or batch_128.
+
+## 6: Context Length
+
+**Question:** Can we train faster with shorter context? The current block_size=512 might be overkill for Urban Dictionary entries.
+
+**Data analysis:**
+```
+Length distribution (characters per entry):
+  Median: 122
+  75th:   214
+  90th:   370
+  95th:   529
+
+Entries fitting in each block_size:
+  block_size=128: 52.5%
+  block_size=256: 81.1%
+  block_size=384: 90.7%
+  block_size=512: 94.7%
+```
+
+**Model:** medium (5M params)
+
+**Varied params:**
+| block_size | % entries fit | Expected speedup |
+|------------|---------------|------------------|
+| 128        | 52.5%         | ~4x faster steps |
+| 256        | 81.1%         | ~2x faster steps |
+| 384        | 90.7%         | ~1.3x faster     |
+| 512        | 94.7%         | baseline         |
+
+**Held constant:**
+- batch_size=64, lr=3e-3, dropout=0.05, ff_ratio=4
+- Training time: 60 min each
+- GPU: T4
+
+**Note:** Current batching picks random positions in the corpus stream, not aligned to entry boundaries. Windows typically span 2+ entries. The "% entries fit" is about single-entry containment, not actual training windows.
+
+**Results:**
+| block_size | Steps | Chars/hr | Val Loss |
+|------------|-------|----------|----------|
+| 128        | 41,757 | 342M    | 1.2451   |
+| 256        | 19,814 | 325M    | 1.2136   |
+| 384        | 9,428  | 232M    | 1.2191   |
+| 512        | 8,120  | 266M    | 1.2135   |
+
+![ctx exp](img/ctx_exp.png)
+
+**Conclusions:**
+- ctx_256 and ctx_512 tie on final loss — no training speed advantage either way
+- ctx_256 sees 22% more characters/hr but needs more steps to reach same loss
+- ctx_128 is too aggressive — truncation hurts more than extra data helps
+- Sticking with block_size=256 for future experiments (lower memory, same quality)
 
 # Future planned experiments
-- Learning Rate
-- LR + Batch size
-- FFN vs Attention Ratio
-- Depth vs Width
-- Context length
+[x] Learning Rate
+[x] LR + Batch size
+[ ] FFN vs Attention Ratio
+[ ] Depth vs Width
+[x] Context length
+[ ] tokenization
 
 For all of these, I should try doing small scale experiments and try to extrapolate what it means at a larger scale, then check those results!

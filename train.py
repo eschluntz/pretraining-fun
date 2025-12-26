@@ -67,10 +67,10 @@ def train_run(
         return x.to(device), y.to(device)
 
     @torch.no_grad()
-    def estimate_loss(model):
+    def estimate_loss(model, splits=("train", "val")):
         out = {}
         model.eval()
-        for split in ["train", "val"]:
+        for split in splits:
             losses = torch.zeros(eval_iters)
             for k in range(eval_iters):
                 xb, yb = get_batch(split)
@@ -144,6 +144,8 @@ def train_run(
 
     start_time = time.time()
     last_eval_time = start_time
+    eval_time_total = 0.0
+    checkpoint_time_total = 0.0
 
     while True:
         elapsed_this_run = time.time() - start_time
@@ -171,12 +173,15 @@ def train_run(
         # Eval and checkpoint based on time
         if time.time() - last_eval_time >= eval_interval_seconds:
             last_eval_time = time.time()
-            losses = estimate_loss(model)
+
+            eval_start = time.time()
+            losses = estimate_loss(model, splits=("train",))
+            eval_time_total += time.time() - eval_start
+
             total_elapsed = elapsed_before + (time.time() - start_time)
-            print(f"[{run_name}] [{total_elapsed:.0f}s] step {step}: train {losses['train']:.4f}, val {losses['val']:.4f}")
+            print(f"[{run_name}] [{total_elapsed:.0f}s] step {step}: train {losses['train']:.4f}")
             wandb.log({
                 "train_loss": losses["train"],
-                "val_loss": losses["val"],
                 "step": step,
                 "elapsed_seconds": total_elapsed,
                 "learning_rate": optimizer.param_groups[0]['lr'],
@@ -184,6 +189,7 @@ def train_run(
             })
 
             # Save checkpoint
+            ckpt_start = time.time()
             torch.save({
                 "model": model._orig_mod.state_dict(),  # unwrap compiled model
                 "optimizer": optimizer.state_dict(),
@@ -192,12 +198,21 @@ def train_run(
                 "wandb_run_id": wandb_run_id,
             }, checkpoint_path)
             checkpoint_volume.commit()
+            checkpoint_time_total += time.time() - ckpt_start
             print(f"Checkpoint saved to {checkpoint_path}")
 
-    # Final eval
+    # Final eval (includes val)
     final_losses = estimate_loss(model)
     total_elapsed = elapsed_before + (time.time() - start_time)
     print(f"Final: train loss {final_losses['train']:.4f}, val loss {final_losses['val']:.4f}")
+    wandb.log({"train_loss": final_losses["train"], "val_loss": final_losses["val"], "step": step})
+
+    # Timing breakdown
+    train_time = total_elapsed - eval_time_total - checkpoint_time_total
+    print(f"\nTiming breakdown:")
+    print(f"  Training:     {train_time:.1f}s ({100*train_time/total_elapsed:.1f}%)")
+    print(f"  Eval:         {eval_time_total:.1f}s ({100*eval_time_total/total_elapsed:.1f}%)")
+    print(f"  Checkpoint:   {checkpoint_time_total:.1f}s ({100*checkpoint_time_total/total_elapsed:.1f}%)")
 
     # Generate sample
     idx = torch.zeros((1, 1), dtype=torch.long, device=device)
@@ -230,12 +245,14 @@ def main():
     print(f"Result: {result}")
 
 
-@app.function(image=image, timeout=5400)  # 1.5 hours for sweep coordinator
+@app.function(image=image, timeout=5400)  # 1.5hr buffer
 def sweep():
-    """Run a parallel sweep over learning rates on medium model."""
+    """Context length sweep on medium model."""
     configs = [
-        {"n_embed": 256, "num_heads": 8, "n_layers": 6, "run_name": "lr_med_6e-3", "max_seconds": 3600, "learning_rate": 6e-3},
-        {"n_embed": 256, "num_heads": 8, "n_layers": 6, "run_name": "lr_med_1e-2", "max_seconds": 3600, "learning_rate": 1e-2},
+        {"n_embed": 256, "num_heads": 8, "n_layers": 6, "run_name": "ctx_128", "max_seconds": 3600, "batch_size": 64, "block_size": 128, "learning_rate": 3e-3},
+        {"n_embed": 256, "num_heads": 8, "n_layers": 6, "run_name": "ctx_256", "max_seconds": 3600, "batch_size": 64, "block_size": 256, "learning_rate": 3e-3},
+        {"n_embed": 256, "num_heads": 8, "n_layers": 6, "run_name": "ctx_384", "max_seconds": 3600, "batch_size": 64, "block_size": 384, "learning_rate": 3e-3},
+        {"n_embed": 256, "num_heads": 8, "n_layers": 6, "run_name": "ctx_512", "max_seconds": 3600, "batch_size": 64, "block_size": 512, "learning_rate": 3e-3},
     ]
 
     # Launch all experiments in parallel
