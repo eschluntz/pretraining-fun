@@ -74,7 +74,7 @@ def main():
 
     enc = tiktoken.get_encoding("gpt2")
 
-    # Newline is the entry separator in the corpus — use it as start token
+    # Newline is the entry separator in the corpus — use as start AND stop token
     newline_token = enc.encode("\n")[0]  # token 198 in GPT-2
 
     for i in range(args.num_samples):
@@ -85,8 +85,15 @@ def main():
         else:
             idx = torch.tensor([[newline_token]], dtype=torch.long, device=args.device)
 
-        generated = model.generate(idx, max_new_tokens=args.max_tokens)
-        text = enc.decode(generated[0].tolist())
+        generated = model.generate(idx, max_new_tokens=args.max_tokens, stop_token=newline_token)
+        tokens_out = generated[0].tolist()
+
+        # Truncate at first newline (after the initial one)
+        if newline_token in tokens_out[1:]:
+            end_idx = tokens_out.index(newline_token, 1)
+            tokens_out = tokens_out[:end_idx]
+
+        text = enc.decode(tokens_out)
 
         print(f"\n{'='*60}")
         if args.num_samples > 1:

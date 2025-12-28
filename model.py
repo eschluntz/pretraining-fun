@@ -149,14 +149,29 @@ class Transformer(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens):
+    def generate(self, idx, max_new_tokens, stop_token=None):
+        """Generate tokens. If stop_token is set, stop each sequence when it's produced."""
         self.eval()
+        B = idx.shape[0]
+        done = torch.zeros(B, dtype=torch.bool, device=idx.device)
+
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.config.block_size:]
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
+
+            # Once done, keep emitting stop token (as padding)
+            if stop_token is not None:
+                idx_next = torch.where(done.unsqueeze(1), stop_token, idx_next)
+                done = done | (idx_next.squeeze(1) == stop_token)
+
             idx = torch.cat((idx, idx_next), dim=1)
+
+            # Early exit if all sequences are done
+            if stop_token is not None and done.all():
+                break
+
         self.train()
         return idx
