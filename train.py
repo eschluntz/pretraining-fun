@@ -66,13 +66,13 @@ def train_run(
 
     # Load data
     if tokenizer == "tiktoken":
-        train_data, val_data, vocab_size, _encode, decode, chars_per_token = load_tiktoken_data("/data/corpus.txt")
+        train_data, val_data, vocab_size, encode, decode, chars_per_token = load_tiktoken_data("/data/corpus.txt")
     elif tokenizer == "bpe500":
-        train_data, val_data, vocab_size, _encode, decode, chars_per_token = load_sentencepiece_data("/data/corpus.txt", "/data/bpe_500.model")
+        train_data, val_data, vocab_size, encode, decode, chars_per_token = load_sentencepiece_data("/data/corpus.txt", "/data/bpe_500.model")
     elif tokenizer == "bpe1k":
-        train_data, val_data, vocab_size, _encode, decode, chars_per_token = load_sentencepiece_data("/data/corpus.txt", "/data/bpe_1000.model")
+        train_data, val_data, vocab_size, encode, decode, chars_per_token = load_sentencepiece_data("/data/corpus.txt", "/data/bpe_1000.model")
     else:
-        train_data, val_data, vocab_size, _encode, decode = load_char_data("/data/corpus.txt")
+        train_data, val_data, vocab_size, encode, decode = load_char_data("/data/corpus.txt")
         chars_per_token = 1.0
 
     # Batching
@@ -257,8 +257,9 @@ def train_run(
     print(f"  Eval:         {eval_time_total:.1f}s ({100*eval_time_total/total_elapsed:.1f}%)")
     print(f"  Checkpoint:   {checkpoint_time_total:.1f}s ({100*checkpoint_time_total/total_elapsed:.1f}%)")
 
-    # Generate sample
-    idx = torch.zeros((1, 1), dtype=torch.long, device=device)
+    # Generate sample (start with newline token — the entry separator)
+    newline_token = encode("\n")[0]
+    idx = torch.tensor([[newline_token]], dtype=torch.long, device=device)
     generated = decode(model.generate(idx, max_new_tokens=200)[0].tolist())
     print(f"\nGenerated sample:\n{generated}")
     wandb.log({"generated_sample": generated})

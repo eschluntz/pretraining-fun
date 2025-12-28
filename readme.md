@@ -285,13 +285,66 @@ Block sizes chosen to match ~256 char effective context:
 **Qualitative Generation Results**
 From reading some of the outputs, i think the tiktoken runs produced the best outputs. I trust that more than the BPC comparisons for my purposes!
 
-# Future planned experiments
-[x] Learning Rate
-[x] LR + Batch size
-[ ] FFN vs Attention Ratio
-[ ] Depth vs Width
-[x] Context length
-[x] Tokenization
-[ ] non-linearity: ReLU vs GeLU vs SWiGLU
+## 8: 24hr Scaling Run — 10M to 100M
 
-For all of these, I should try doing small scale experiments and try to extrapolate what it means at a larger scale, then check those results!
+**Question:** How far can we scale with 24hr of A10G compute? What's the best model size for this budget?
+
+Based on learnings from experiments 1-7, consolidated best practices into a single large-scale run.
+
+**Architecture choices (from prior experiments):**
+- Tiktoken tokenizer (exp 7: beat char-level)
+- tie_weights=True (critical for 50K vocab)
+- block_size=64 tokens (~260 chars, covers median entry)
+- batch_size=64 (exp 5: at critical batch size)
+- GPT-2-style depth/width ratios (d_model/n_layers ≈ 50-80)
+- GELU activation (switched from ReLU)
+- dropout=0.1 (increased for multi-epoch training)
+
+**Training setup:**
+- LR: scaled by 1/√(params) from 5M baseline
+- LR schedule: 2000 step linear warmup → cosine decay to 10% of peak
+- GPU: A10G (~2x faster than T4)
+- TF32 matmul precision enabled
+- Training time: 24hr each
+- Atomic checkpoints for preemption safety
+
+**Model configs:**
+| Run | n_embed | heads | layers | ~Params | d/L ratio | LR |
+|-----|---------|-------|--------|---------|-----------|------|
+| scale_10m | 192 | 3 | 4 | 11M | 48 | 3e-3 |
+| scale_25m | 320 | 5 | 6 | 23M | 53 | 2e-3 |
+| scale_50m | 512 | 8 | 8 | 51M | 64 | 1.5e-3 |
+| scale_100m | 768 | 12 | 10 | 109M | 77 | 1e-3 |
+| scale_50m_swiglu | 512 | 8 | 8 | ~51M | 64 | 1.5e-3 |
+
+All have 64 dim per head (matching GPT-2). The 50M config matches GPT-2 Small proportions scaled down.
+
+**SwiGLU variant:** Same as scale_50m but using SwiGLU FFN (LLaMA-style) instead of GELU. Uses 8/3 expansion ratio to match parameter count.
+
+**Expected epochs (with A10G speeds):**
+| Run | Est. steps/hr | Est. epochs |
+|-----|---------------|-------------|
+| scale_10m | ~35,000 | ~30 |
+| scale_25m | ~20,000 | ~17 |
+| scale_50m | ~12,000 | ~10 |
+| scale_100m | ~7,000 | ~6 |
+
+**Results:**
+
+| Run | Params | Val BPC | Time | Notes |
+|-----|--------|---------|------|-------|
+| scale_100m | 109M | **1.33** | 24hr | Best overall |
+| scale_50m | 51M | **1.34** | 24hr | Nearly tied 100m |
+| scale_50m_swiglu | 51M | ~1.34 | 7hr (paused) | Identical to GELU, stopped early |
+| scale_25m | 23M | 1.46 | 6hr (paused) | Plateaued, stopped early |
+| scale_10m | 11M | 1.56 | 2.3hr (paused) | Plateaued quickly |
+
+**Observations:**
+- **100m barely beats 50m** — only 0.01 BPC difference despite 2x params. 50m is more compute-efficient for this budget.
+- **SwiGLU ≈ GELU** — no measurable difference at 50M scale; GELU is simpler.
+- **Smaller models plateau early** — 10m and 25m overtrained (too many epochs on limited data). Correctly predicted from epoch estimates.
+- **Best result: 1.33 BPC** — down from 1.66 BPC (gpt2_8m in exp 7), a 20% improvement from scaling 8M → 100M.
+
+**Conclusion:** For 24hr A10G budget on this dataset, 50M is the sweet spot. Larger models give diminishing returns; smaller models overtrain.
+
+![100m scale](img/100m_scale.png)
