@@ -348,3 +348,12 @@ All have 64 dim per head (matching GPT-2). The 50M config matches GPT-2 Small pr
 **Conclusion:** For 24hr A10G budget on this dataset, 50M is the sweet spot. Larger models give diminishing returns; smaller models overtrain.
 
 ![100m scale](img/100m_scale.png)
+
+## Cherry-Picked Sample Generations
+(Heavily heavily filtered for SFW)
+
+- Phil Collins cool: Being the cool kid star player, but still passes the ball to the freshman.
+- cremeragon: An orange-white color dragon which breathes snow. It is said to have adapted fire, and became a playable character class 
+- Indivisual: Knowing alot about indie music, possibly from what you heard.
+- MLK: 'my life kicks ass' ;; - a phrase used to express understanding one has found the most amazing course of action.
+- yarium: volatile, evil and vocal driven destruction brought on by drinking too much alcohol.
