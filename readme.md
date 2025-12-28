@@ -353,7 +353,42 @@ All have 64 dim per head (matching GPT-2). The 50M config matches GPT-2 Small pr
 (Heavily heavily filtered for SFW)
 
 - Phil Collins cool: Being the cool kid star player, but still passes the ball to the freshman.
-- cremeragon: An orange-white color dragon which breathes snow. It is said to have adapted fire, and became a playable character class 
+- cremeragon: An orange-white color dragon which breathes snow. It is said to have adapted fire, and became a playable character class
 - Indivisual: Knowing alot about indie music, possibly from what you heard.
 - MLK: 'my life kicks ass' ;; - a phrase used to express understanding one has found the most amazing course of action.
 - yarium: volatile, evil and vocal driven destruction brought on by drinking too much alcohol.
+
+# Running Generation Locally
+
+## Download checkpoints from Modal
+
+```bash
+# Create checkpoints directory
+mkdir -p checkpoints
+
+# Download models from Modal volume
+modal volume get transformer-checkpoints scale_50m.pt ./checkpoints/scale_50m.pt
+modal volume get transformer-checkpoints scale_100m.pt ./checkpoints/scale_100m.pt
+```
+
+## Generate samples
+
+```bash
+# Generate random entries
+python generate.py --checkpoint checkpoints/scale_50m.pt --num-samples 5
+
+# Generate with a prompt (word: or partial definition)
+python generate.py --checkpoint checkpoints/scale_50m.pt --prompt "vibe check:"
+
+# Use GPU for faster generation
+python generate.py --checkpoint checkpoints/scale_100m.pt --device cuda --num-samples 10
+
+# Longer generations (default max-tokens=200)
+python generate.py --checkpoint checkpoints/scale_50m.pt --max-tokens 500
+```
+
+## Notes
+- Prompts should NOT include a leading newline (added automatically)
+- Prompts should NOT include a leading space (words start immediately after newline in corpus)
+- Generation stops at newline (entry boundary) or max-tokens
+- Tiktoken (GPT-2) tokenizer is used — install with `pip install tiktoken`
